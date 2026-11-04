@@ -30,16 +30,38 @@ If the POST doesn't confirm the write, the client makes one GET for the original
 
 ![After one POST, the client accepts an exact committed record from the 201 response or one 200 readback. All other readback outcomes stop at Unknown. No path sends another POST.](./images/operation-outcomes.png)
 
+The recorded `LostResponse` run used a fixed operation ID; your run generates one by default. The client returned this complete object and exit `0`:
+
+```json
+{
+  "Outcome": "ConfirmedSuccess",
+  "ConfirmedBy": "Readback",
+  "OperationId": "f42a9b21-54ed-42ca-b21c-1b8c134af001",
+  "WriteStatus": null,
+  "WriteError": "System.Threading.Tasks.TaskCanceledException: The request was canceled due to the configured HttpClient.Timeout of 3 seconds elapsing.",
+  "ReadStatus": 200,
+  "ReadError": null,
+  "Reason": "ExactCommittedRecord"
+}
+```
+
+Readback confirmed the saved schedule, and `WriteError` still contains the POST timeout. An independent file check found the saved record while the client was still waiting. When the client finished, the request journal held one POST and one GET; the schedule file held one exact record.
+
 ## Start the API in terminal A
 
 You need PowerShell 7.6, two terminals, a writable directory and free loopback port `8765`. Everything runs locally, with no modules or credentials.
 
 The recorded results come from programmatic execution on macOS 26.3.2 ARM64 with PowerShell 7.6.9 and .NET 10.0.14. The instructions below weren't executed as an interactive terminal A/B session. Execution on Windows, Linux and Windows PowerShell 5.1 remains unverified.
 
-Open PowerShell in terminal A and create the lab folder:
+In terminal A, start PowerShell:
 
 ```powershell
 pwsh -NoProfile
+```
+
+Wait for the new PowerShell prompt, then paste these commands to create the lab folder:
+
+```powershell
 $PSVersionTable.PSVersion
 New-Item -ItemType Directory -Path './api outcome lab'
 Set-Location -LiteralPath './api outcome lab'
@@ -154,10 +176,15 @@ The fixture can hold eight responses; the next attempted hold throws. If a POST 
 
 ## Save the intent in terminal B
 
-Open a fresh terminal in the parent directory where you created the lab folder. Enter PowerShell and select the folder:
+Open a fresh terminal in the parent directory where you created the lab folder. Start PowerShell:
 
 ```powershell
 pwsh -NoProfile
+```
+
+Wait for the new PowerShell prompt, then paste the command to select the lab folder:
+
+```powershell
 Set-Location -LiteralPath './api outcome lab'
 ```
 
@@ -323,23 +350,6 @@ $intent = Get-Content -LiteralPath './intent.json' -Raw | ConvertFrom-Json
 Get-Content -LiteralPath './run-lost/schedules.jsonl' | ConvertFrom-Json | Format-List
 Get-Content -LiteralPath './run-lost/requests.jsonl' | ConvertFrom-Json | Select-Object method, path
 ```
-
-The recorded `LostResponse` run used a fixed operation ID; your run generates one by default. The client returned this complete object and exit `0`:
-
-```json
-{
-  "Outcome": "ConfirmedSuccess",
-  "ConfirmedBy": "Readback",
-  "OperationId": "f42a9b21-54ed-42ca-b21c-1b8c134af001",
-  "WriteStatus": null,
-  "WriteError": "System.Threading.Tasks.TaskCanceledException: The request was canceled due to the configured HttpClient.Timeout of 3 seconds elapsing.",
-  "ReadStatus": 200,
-  "ReadError": null,
-  "Reason": "ExactCommittedRecord"
-}
-```
-
-Readback confirmed the saved schedule, and `WriteError` still contains the POST timeout. An independent file check found the saved record while the client was still waiting. When the client finished, the request journal held one POST and one GET; the schedule file held one exact record.
 
 For automation, accept success only from a completed invocation with the full `ConfirmedSuccess` object for the original operation ID and native exit `0`. Exit `0` alone isn't enough.
 
