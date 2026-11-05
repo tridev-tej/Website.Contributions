@@ -16,7 +16,7 @@ image_alt: "A lookup with the original operation ID checks a saved schedule afte
 draft: true
 ---
 
-In this synthetic run, PowerShell reported a POST timeout after the API had saved the schedule. Repeating the POST would have created another schedule. The client checked the original operation ID and confirmed the write through a GET before reporting success.
+In the synthetic `LostResponse` run, the API saved a schedule before PowerShell reported a POST timeout. Repeating the POST would have created another schedule. The client used the original operation ID to confirm the write through a GET before reporting success.
 
 The local API saves configuration for a nightly inventory export; it doesn't run an export. Its lost-response mode deliberately saves the schedule and withholds the response. You can compare the client result with the saved row, including runs where the schedule exists but the client can't confirm it.
 
@@ -24,9 +24,11 @@ The local API saves configuration for a nightly inventory export; it doesn't run
 
 An `Invoke-WebRequest` error tells you what the client observed. It doesn't establish whether the server committed the write. [HTTP's idempotency rules](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2) explain why a communication failure alone doesn't justify repeating a non-idempotent request.
 
-This client saves the operation ID and intended payload before sending one POST. It never repeats the POST automatically. A `201` confirms success only if its body contains that exact committed record.
+The client saves the operation ID and intended payload, then sends one POST. Only `201` with that exact committed record confirms the write through the response.
 
-If the POST doesn't confirm the write, the client makes one GET for the original ID; only `200` with the exact record confirms it. Every other API observation leaves the outcome unknown. Stop automation that depends on an unconfirmed write.
+If the POST doesn't confirm the write, the client makes one GET for the original ID; only `200` with the exact record confirms it. Every other API observation leaves the outcome unknown. The client never repeats the POST automatically, and automation that depends on an unconfirmed write must stop.
+
+### Expected lost-response result
 
 ![After one POST, the client accepts an exact committed record from the 201 response or one 200 readback. All other readback outcomes stop at Unknown. No path sends another POST.](./images/operation-outcomes.png)
 
@@ -47,11 +49,15 @@ The recorded `LostResponse` run used a fixed operation ID; your run generates on
 
 Readback confirmed the saved schedule, and `WriteError` still contains the POST timeout. An independent file check found the saved record while the client was still waiting. When the client finished, the request journal held one POST and one GET; the schedule file held one exact record.
 
+To reproduce this run, [start the API](#start-the-api-in-terminal-a), [save the complete client](#save-the-intent-in-terminal-b), then [check the result and saved schedule](#check-the-result-and-the-saved-schedule). The [record acceptance rules](#why-a-response-can-fail-the-record-check) explain why a successful HTTP status can still leave the write unconfirmed.
+
 ## Start the API in terminal A
 
 You need PowerShell 7.6, two terminals, a writable directory and free loopback port `8765`. Everything runs locally, with no modules or credentials.
 
-The recorded results come from programmatic execution on macOS 26.3.2 ARM64 with PowerShell 7.6.9 and .NET 10.0.14. The instructions below weren't executed as an interactive terminal A/B session. Execution on Windows, Linux and Windows PowerShell 5.1 remains unverified.
+The directly recorded results come from programmatic execution on macOS 26.3.2 ARM64 with PowerShell 7.6.9 and .NET 10.0.14. Separately, in [review 5766249733](https://github.com/EvotecIT/Website.Contributions/pull/19#pullrequestreview-5766249733), maintainer PrzemyslawKlys reported running both listings on Windows with PowerShell 7.6.9. All six scenarios matched the table in that report.
+
+Independent Windows execution, Linux, Windows PowerShell 5.1 and an interactive terminal A/B walkthrough remain unperformed.
 
 In terminal A, start PowerShell:
 
@@ -67,6 +73,10 @@ New-Item -ItemType Directory -Path './api outcome lab'
 Set-Location -LiteralPath './api outcome lab'
 (Get-Location).Path
 ```
+
+`Receive-Request` journals each request in `requests.jsonl`. `Save-Schedule` appends each created schedule to `schedules.jsonl` before handling the response, so a response failure can leave a saved schedule behind.
+
+In `LostResponse`, `Hold-Response` keeps the unanswered HTTP context in memory while the listener continues accepting requests. The client's GET can reach `Read-Operation` and retrieve the saved schedule while the POST remains unanswered.
 
 Save the complete server listing as `server.ps1` in that folder:
 
@@ -162,8 +172,6 @@ try {
 }
 ```
 
-The server appends each request to `requests.jsonl` and each created schedule to `schedules.jsonl`. It closes the schedule-file append before handling the response, so a response failure can leave a saved schedule behind. In `LostResponse`, it keeps the unanswered HTTP context in memory and continues accepting requests, allowing the client's GET to reach it.
-
 Start the server in the foreground:
 
 ```powershell
@@ -188,9 +196,17 @@ Wait for the new PowerShell prompt, then paste the command to select the lab fol
 Set-Location -LiteralPath './api outcome lab'
 ```
 
-Save the following listing as `client.ps1`. Before it sends anything, the client writes the original operation ID and intended payload to `intent.json`. That gives you something to compare with the server's record if the response is lost. `CreateNew` refuses an existing intent file before networking; another invocation won't automatically resume or resend it.
+The top-level `$id` and `$intent` block builds the operation ID and payload, encodes them as UTF-8, then opens `$IntentPath` with `[IO.FileMode]::CreateNew`. It writes and closes that file before any networking, preserving the intent for both confirmation paths. The default file is `intent.json`; an existing file stops the invocation before it sends anything. Rerunning the client won't automatically resume or resend an earlier intent.
 
-The saved intent lets the client ask whether this operation committed the schedule you requested. The response must have the required status and pass JSON decoding, shape and type checks before the client compares its record with that intent. That decision determines whether readback is needed. Transport failures retain their diagnostics; unexpected local errors still throw.
+One `Invoke-WebRequest` POST sends those saved bytes. If it throws, `Get-RequestError` retains the native exception type and message for expected transport failures and rethrows unexpected local errors. The timeout is evidence of what the client observed; it doesn't say whether the server saved the schedule.
+
+`Get-ResponseReason $write 201` requires status `201` before calling `Get-RecordReason` to compare the response with the intent. Only the exact record for the original ID, state `committed` and intended payload returns `ExactCommittedRecord`. A `201` with a different record can't confirm this write.
+
+Otherwise, the client makes one GET to `/operations/$id` with the original ID. `Get-ResponseReason $read 200` requires status `200` and applies the same record checks. Readback can confirm a write whose response was lost without another POST or a new operation ID.
+
+Either confirmation path emits the full `ConfirmedSuccess` object and exits `0`. A completed but unconfirmed API result stays `Unknown` and exits `2`, so automation that depends on the write must stop there.
+
+Save the complete listing as `client.ps1` in the lab folder:
 
 ```powershell
 param(
@@ -336,7 +352,7 @@ exit 2
 
 The two [web-command timeout settings](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/invoke-webrequest?view=powershell-7.6#-connectiontimeoutseconds) limit different waits: `ConnectionTimeoutSeconds` bounds a pending request, and `OperationTimeoutSeconds` limits a stalled stream read. Both are three seconds here. Neither sets a deadline for the whole script or tells the server to roll back. Status-based retries and redirects are disabled.
 
-`SkipHttpErrorCheck` lets the client inspect an error HTTP status without accepting its body as proof of success. Expected transport failures keep their native exception type and message; unexpected local errors throw. [PowerShell's terminating-error handling](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_try_catch_finally?view=powershell-7.6) explains how those errors reach `catch`.
+`SkipHttpErrorCheck` lets the client inspect an error HTTP status without accepting its body as proof of success. [PowerShell's terminating-error handling](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_try_catch_finally?view=powershell-7.6) explains how request errors reach the `catch` block and `Get-RequestError`.
 
 ## Check the result and the saved schedule
 
@@ -351,23 +367,9 @@ Get-Content -LiteralPath './run-lost/schedules.jsonl' | ConvertFrom-Json | Forma
 Get-Content -LiteralPath './run-lost/requests.jsonl' | ConvertFrom-Json | Select-Object method, path
 ```
 
-For automation, accept success only from a completed invocation with the full `ConfirmedSuccess` object for the original operation ID and native exit `0`. Exit `0` alone isn't enough.
+Compare your result with the [complete lost-response result below the diagram](#expected-lost-response-result). For automation, accept success only from a completed invocation with the full `ConfirmedSuccess` object for the original operation ID and native exit `0`. Exit `0` alone isn't enough.
 
 Compare the server files with `intent.json`, counting requests and saved rows separately. A `ConfirmedSuccess` object doesn't establish how many schedules were created. Here, expect one POST to `/schedules` and one GET to `/operations/` followed by the original `$intent.operationId`. The saved record must have that ID, state `committed`, and a payload containing `task: inventory-export`, `timeUtc: 02:30` and Boolean `enabled: true`.
-
-### Check the record against the saved intent
-
-A `200` can carry the wrong schedule: `03:30` doesn't match an intent for `02:30`, and a different operation ID describes another write. Even JSON string `"true"` fails because the saved intent requires the Boolean `true`.
-
-The client uses [JsonDocument](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/use-dom#use-jsondocument) to require a root object with exactly `operationId`, `state` and `payload`, and a payload object with exactly `task`, `timeUtc` and `enabled`. Both objects must contain every field once; extra or duplicate fields fail, as does a one-element array.
-
-`operationId`, `state`, `task` and `timeUtc` must be JSON strings whose decoded values match the original ID, `committed`, and the saved task and time. `enabled` must be a real JSON Boolean equal to the intended `true`.
-
-The check compares decoded property names and string values with culture-independent ordinal equality: text and case must match exactly. Equivalent string escaping, property order and whitespace may vary. Ordinary [PowerShell comparisons](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_comparison_operators?view=powershell-7.6) can coerce values or ignore case; neither is allowed here.
-
-JSON parsing can succeed before .NET decodes every string. `Get-JsonString` checks the local type before decoding a property name or value.
-
-A `201` response with an undecodable string is classified as `UndecodableString` and can't confirm the write. The client still makes its one GET for the original ID, where `200` with an exact committed record can confirm it. An undecodable `200` readback leaves the outcome `Unknown`. Wrong local types, disposed objects and unexpected errors still throw.
 
 ## A saved row can coexist with a 404
 
@@ -387,7 +389,9 @@ $LASTEXITCODE
 Get-Content -LiteralPath './run-missing/schedules.jsonl'
 ```
 
-The recorded client result was `Unknown`, `ReadStatus: 404`, `Reason: HttpStatus:404` and exit `2`. The schedule file still contained the exact saved record. This fixture hides that record from the read path, so its `404` doesn't establish rollback. Before treating a missing record as evidence that no write occurred, check the API's documented read consistency and operation-retention guarantees.
+The recorded client result was `Unknown`, `ReadStatus: 404`, `Reason: HttpStatus:404` and exit `2`. The schedule file still contained the exact saved record. The fixture hides that record from the read path, so its `404` doesn't establish rollback.
+
+Before treating a missing record as evidence that no write occurred, check the API's documented read consistency and operation-retention guarantees.
 
 All six recorded runs against the PowerShell server saved one row. A `503`, a `404`, the wrong time in a `200` record or a read timeout left the client at `Unknown` despite that saved row. For each additional scenario, stop the server and use a fresh run directory and intent filename.
 
@@ -420,6 +424,28 @@ The `ReadbackLost` run returned this complete object and exit `2`:
 The final `Reason` reports `ExactCommittedRecord` or the failed check: HTTP status, transport failure, invalid JSON, undecodable string, invalid shape or record mismatch. `WriteError` and `ReadError` retain exception diagnostics. An unhandled local or script-terminating error exits `1`; a completed `Unknown` API result exits `2`.
 
 Cancellation can end the client before it emits a complete result and doesn't undo a server commit. Microsoft documents [Ctrl+C exit `0` for `pwsh -File`](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_pwsh?view=powershell-7.6#-file--f), so a missing or incomplete result leaves the write uncertain even with exit `0`. This client has no cancellation-triggered GET in `finally`. Fresh cancellation wasn't measured here; behavior across hosts and termination mechanisms remains unverified.
+
+## Why a response can fail the record check
+
+### Confirming the wrong operation or schedule
+
+`Get-RecordReason` checks which operation committed and what it saved. A different operation ID identifies another write; a schedule for `03:30` doesn't match the intended `02:30`. The record must also say `committed`, with the original task and enabled value.
+
+`Test-StringFields` requires JSON strings for `operationId`, `state`, `task` and `timeUtc`. `Get-JsonString` decodes their values for comparison with the original ID, `committed`, and the saved task and time. `enabled` must be a real JSON Boolean equal to the intended `true`; JSON string `"true"` fails.
+
+The checks compare decoded property names and string values with culture-independent ordinal equality, so text and case must match exactly. Equivalent string escaping, property order and whitespace may vary. Ordinary [PowerShell comparisons](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_comparison_operators?view=powershell-7.6) can coerce values or ignore case; neither is allowed here.
+
+### Accepting missing or ambiguous fields
+
+The client uses [JsonDocument](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/use-dom#use-jsondocument) to inspect fields before comparing values. `Test-Fields` requires a root object with exactly `operationId`, `state` and `payload`, and a payload object with exactly `task`, `timeUtc` and `enabled`.
+
+Each required field must occur once in its object. Missing, extra or duplicate fields fail, as does a one-element array in place of either object. The client can't confirm an incomplete record or choose between duplicate values.
+
+### Accepting a string that cannot be decoded
+
+JSON parsing can succeed before .NET decodes every property name or string value. `Get-JsonString` checks the local type before decoding. A deferred unescape error can still prevent a parsed response from confirming the write.
+
+`Get-ResponseReason` classifies that decoding failure as `UndecodableString`. For a `201`, the client proceeds to its one GET for the original ID, where `200` with the exact committed record can still confirm it. An undecodable `200` readback leaves `Unknown`. Wrong local types, disposed objects and unexpected errors still throw; they aren't classified as uncertain API results.
 
 ## Repeat the POST deliberately
 
